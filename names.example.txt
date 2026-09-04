@@ -1,0 +1,6 @@
+# One Steam market_hash_name per line. Lines starting with # are ignored.
+# Team Fortress 2 (appid 440):
+Mann Co. Supply Crate Key
+Tour of Duty Ticket
+Strange Rocket Launcher
+Refined Metal
