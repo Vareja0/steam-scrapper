@@ -51,6 +51,11 @@ Examples
 
     # From a file (one market_hash_name per line)
     python steam_market_scraper.py --appid 440 --items-file names.txt -o out.csv
+
+    # Big run that keeps getting rate-limited: spread load over a proxy pool and
+    # make it resumable, so re-running after a ban skips what's already saved.
+    python steam_market_scraper.py --appid 440 --discover-all \
+        --proxies-file proxies.txt --resume -o tf2_prices.csv
 """
 from __future__ import annotations
 
@@ -65,6 +70,7 @@ import statistics
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import requests
@@ -84,7 +90,8 @@ CURRENCIES = {1: "USD", 2: "GBP", 3: "EUR", 5: "RUB", 7: "BRL", 20: "PLN", 23: "
 # --------------------------------------------------------------------------- #
 class SteamClient:
     def __init__(self, currency: int = 1, delay: float = 3.0, cookie: str | None = None,
-                 timeout: float = 30.0, max_retries: int = 4):
+                 timeout: float = 30.0, max_retries: int = 4,
+                 proxies: list[str] | None = None):
         self.currency = currency
         self.delay = delay
         self.timeout = timeout
@@ -93,35 +100,64 @@ class SteamClient:
         self.s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
         if cookie:
             self.s.cookies.set("steamLoginSecure", cookie, domain="steamcommunity.com")
-        self._last = 0.0
+        # Proxy pool: rotated once per request for an even spread, and again
+        # whenever an exit trips a 429/5xx, so each exit IP keeps its own Steam
+        # rate-limit budget instead of one address absorbing the whole run.
+        self.proxies = list(proxies or [])
+        self._proxy_idx = 0
+        # Last-request wall-clock keyed by exit ("" == direct, else proxy URL),
+        # so the throttle only delays us on the exit we're about to reuse.
+        self._last_by_exit: dict[str, float] = {}
 
-    def _throttle(self):
-        wait = self.delay - (time.time() - self._last)
+    def _current_proxy(self) -> str | None:
+        if not self.proxies:
+            return None
+        return self.proxies[self._proxy_idx % len(self.proxies)]
+
+    def _rotate_proxy(self):
+        if self.proxies:
+            self._proxy_idx = (self._proxy_idx + 1) % len(self.proxies)
+
+    def _throttle(self, exit_key: str):
+        wait = self.delay - (time.time() - self._last_by_exit.get(exit_key, 0.0))
         if wait > 0:
             time.sleep(wait + random.uniform(0, 0.4))
 
     def get(self, url: str, *, params: dict | None = None, referer: str | None = None):
         headers = {"Referer": referer} if referer else {}
+        self._rotate_proxy()  # even spread across the pool on the happy path
         for attempt in range(1, self.max_retries + 1):
-            self._throttle()
+            proxy = self._current_proxy()
+            exit_key = proxy or ""
+            self._throttle(exit_key)
+            req_proxies = {"http": proxy, "https": proxy} if proxy else None
             try:
-                r = self.s.get(url, params=params, headers=headers, timeout=self.timeout)
+                r = self.s.get(url, params=params, headers=headers,
+                               timeout=self.timeout, proxies=req_proxies)
             except requests.RequestException as exc:
+                self._last_by_exit[exit_key] = time.time()
                 if attempt == self.max_retries:
                     raise
                 _warn(f"request error ({exc}); retry {attempt}/{self.max_retries}")
+                self._rotate_proxy()
                 time.sleep(5 * attempt)
                 continue
-            finally:
-                self._last = time.time()
+            self._last_by_exit[exit_key] = time.time()
 
             if r.status_code == 429:
-                back = 30 * attempt
-                _warn(f"rate limited (429); sleeping {back}s [{attempt}/{self.max_retries}]")
+                back = _retry_after_seconds(r)
+                if back is None:
+                    back = 30.0 * attempt
+                back = min(back, 300.0)
+                via = " rotating proxy," if self.proxies else ""
+                _warn(f"rate limited (429);{via} sleeping {back:.0f}s "
+                      f"[{attempt}/{self.max_retries}]")
+                self._rotate_proxy()
                 time.sleep(back)
                 continue
             if r.status_code >= 500:
                 _warn(f"server error {r.status_code}; retry {attempt}/{self.max_retries}")
+                self._rotate_proxy()
                 time.sleep(5 * attempt)
                 continue
             return r
@@ -139,6 +175,25 @@ class SteamClient:
 
 def _warn(msg: str):
     print(f"  ! {msg}", file=sys.stderr)
+
+
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """`Retry-After` header -> seconds to wait (delta-seconds or HTTP-date form),
+    or None when the header is absent or unparseable."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return float(raw)
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +690,19 @@ def scrape_item(client: SteamClient, appid: int, name: str, *,
     return rows
 
 
+def _load_scraped_names(path: str) -> set[str]:
+    """market_hash_name values already present in an existing output CSV, used by
+    --resume to skip items a killed run already wrote."""
+    if not (os.path.exists(path) and os.path.getsize(path) > 0):
+        return set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        if not reader.fieldnames or "market_hash_name" not in reader.fieldnames:
+            _warn(f"{path}: no 'market_hash_name' column; --resume starts fresh")
+            return set()
+        return {row["market_hash_name"] for row in reader if row.get("market_hash_name")}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -652,6 +720,10 @@ def main(argv=None):
     ap.add_argument("-o", "--output", default="steam_market.csv")
     ap.add_argument("--append", action="store_true",
                     help="append to the CSV instead of overwriting")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip items whose market_hash_name is already in the output "
+                         "CSV and append the rest, so a run killed by a rate-limit ban "
+                         "picks up where it stopped (implies --append; not for --wide)")
     ap.add_argument("--wide", action="store_true",
                     help="write one row per item with a price_<date> column per "
                          "observation date, instead of one row per item-day "
@@ -662,7 +734,13 @@ def main(argv=None):
     ap.add_argument("--currency", type=int, default=1,
                     help="Steam currency code (1 USD, 3 EUR, 2 GBP, 7 BRL, ...)")
     ap.add_argument("--delay", type=float, default=3.0,
-                    help="seconds between requests (default 3; lower risks 429)")
+                    help="seconds between requests to the same exit IP (default 3; "
+                         "lower risks 429)")
+    ap.add_argument("--proxies-file",
+                    help="file with one proxy URL per line "
+                         "(http://[user:pass@]host:port or socks5://...); rotated per "
+                         "request and on 429 so each exit IP gets its own Steam "
+                         "rate-limit budget - the biggest lever against blocks")
     ap.add_argument("--no-fill-gaps", action="store_true",
                     help="do not forward-fill days with no sales")
     ap.add_argument("--cookie", default=os.environ.get("STEAM_LOGIN_SECURE"),
@@ -674,12 +752,28 @@ def main(argv=None):
                          "https://steamcommunity.com/dev/apikey")
     args = ap.parse_args(argv)
 
+    if args.resume and args.wide:
+        ap.error("--resume is not compatible with --wide (wide output is one row per "
+                 "item and rewritten whole each run)")
+    if args.resume:
+        args.append = True
+
     names: list[str] = list(args.items)
     if args.items_file:
         with open(args.items_file, encoding="utf-8") as fh:
             names += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
-    client = SteamClient(currency=args.currency, delay=args.delay, cookie=args.cookie)
+    proxies: list[str] = []
+    if args.proxies_file:
+        with open(args.proxies_file, encoding="utf-8") as fh:
+            proxies = [ln.strip() for ln in fh
+                       if ln.strip() and not ln.startswith("#")]
+        if not proxies:
+            ap.error(f"--proxies-file {args.proxies_file!r} has no usable lines")
+        print(f"Proxy pool: {len(proxies)} exit{'' if len(proxies) == 1 else 's'}")
+
+    client = SteamClient(currency=args.currency, delay=args.delay, cookie=args.cookie,
+                         proxies=proxies)
     if not args.cookie:
         _warn("no steamLoginSecure cookie: historical prices are login-gated by "
               "Steam, so rows will mostly be current-snapshot only. "
@@ -709,6 +803,17 @@ def main(argv=None):
     if args.append and args.wide:
         ap.error("--wide is not compatible with --append (each run's date "
                   "columns differ, so wide output can't be appended safely)")
+
+    if args.resume:
+        done = _load_scraped_names(args.output)
+        if done:
+            kept = [n for n in names if n not in done]
+            print(f"Resume: {len(names) - len(kept)} of {len(names)} already in "
+                  f"{args.output}; {len(kept)} left to scrape")
+            names = kept
+        if not names:
+            print("Nothing to do: every requested item is already in the CSV.")
+            return
 
     if args.wide:
         rows_by_item = []
