@@ -104,6 +104,15 @@ dropped.
 | `--cookie VALUE` | `STEAM_LOGIN_SECURE` | `steamLoginSecure` cookie value. Required for price history. |
 | `--api-key KEY` | `STEAM_API_KEY` | Steam Web API key. Required for item tags (quality/rarity/exterior/...). |
 
+### Continuous collection
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--interval MIN` | `0` (off) | After the history run, keep polling the current price of every item every `MIN` minutes and append timestamped rows to the snapshot CSV, until Ctrl+C. |
+| `--snapshot-output PATH` | `<output>_snapshots.csv` | Snapshot CSV. Always appended to, so restarts extend the same history. |
+| `--cycles N` | `0` (forever) | Stop after `N` polling cycles. |
+| `--no-backfill` | off | Skip the one-shot history run and only collect snapshots (e.g. when restarting the collector). |
+
 ### Network / rate limiting
 
 | Flag | Default | Meaning |
@@ -111,6 +120,43 @@ dropped.
 | `--currency CODE` | `1` | Steam currency code: `1` USD, `2` GBP, `3` EUR, `5` RUB, `7` BRL, `20` PLN, `23` UAH. |
 | `--delay SECONDS` | `3.0` | Minimum seconds between requests **to the same exit IP**. Lower risks HTTP 429. |
 | `--proxies-file PATH` | — | File with one proxy URL per line (`http://[user:pass@]host:port` or `socks5://...`; `#` lines ignored). |
+
+## Historical collection
+
+Two complementary sources of history:
+
+1. **History until now** — the one-shot run pulls Steam's full daily price
+   history from `market/pricehistory` (needs `--cookie`) into `-o`.
+2. **History from now on** — `--interval` keeps running after that and polls
+   `market/priceoverview` (no cookie needed) for every item, appending one row
+   per item per cycle to the snapshot CSV:
+   `snapshot_timestamp_utc, appid, market_hash_name, currency, lowest_price,
+   median_price, volume_24h`.
+
+```bash
+# Backfill history, then snapshot every 30 minutes until Ctrl+C
+python steam_market_scraper.py --appid 440 --discover 100 \
+    --cookie "$STEAM_LOGIN_SECURE" --interval 30 -o tf2.csv
+
+# Restart only the collector later (appends to tf2_snapshots.csv)
+python steam_market_scraper.py --appid 440 --discover 100 \
+    --interval 30 --no-backfill -o tf2.csv
+```
+
+Each cycle costs one request per item, so keep `items × --delay` under the
+interval (100 items at `--delay 3` ≈ 5 min per cycle).
+
+### Stopping with Ctrl+C
+
+Ctrl+C at any point saves what was collected so far:
+
+- Long output: every finished item is already flushed to the CSV; the item in
+  progress is dropped — re-run with `--resume` to continue.
+- `--wide` output: the items scraped so far are pivoted and written.
+- Snapshot collection: every row is flushed as soon as it's fetched.
+
+An interrupted history run exits with code 130 and does not start the
+collector.
 
 ## Rate limits, proxies, resuming
 

@@ -52,6 +52,12 @@ Examples
     # From a file (one market_hash_name per line)
     python steam_market_scraper.py --appid 440 --items-file names.txt -o out.csv
 
+    # Backfill history, then keep collecting the current price of every item
+    # every 30 min into tf2_snapshots.csv until Ctrl+C (Ctrl+C always saves
+    # what was collected so far).
+    python steam_market_scraper.py --appid 440 --discover 100 --interval 30 \
+        --cookie "$STEAM_LOGIN_SECURE" -o tf2.csv
+
     # Big run that keeps getting rate-limited: spread load over a proxy pool and
     # make it resumable, so re-running after a ban skips what's already saved.
     python steam_market_scraper.py --appid 440 --discover-all \
@@ -703,6 +709,142 @@ def _load_scraped_names(path: str) -> set[str]:
         return {row["market_hash_name"] for row in reader if row.get("market_hash_name")}
 
 
+SNAPSHOT_COLS = ["snapshot_timestamp_utc", "appid", "market_hash_name", "currency",
+                 "lowest_price", "median_price", "volume_24h"]
+
+
+def default_snapshot_path(output: str) -> str:
+    root, ext = os.path.splitext(output)
+    return f"{root}_snapshots{ext or '.csv'}"
+
+
+def scrape_once(client: SteamClient, args, names: list[str]) -> bool:
+    """One-shot run: full price history (when authed) + current snapshot per
+    item, written to ``args.output``. Returns True if stopped by Ctrl+C - rows
+    for every item finished before the interrupt are already on disk."""
+    interrupted = False
+    if args.wide:
+        rows_by_item = []
+        try:
+            for i, name in enumerate(names, 1):
+                print(f"[{i}/{len(names)}] {name}")
+                try:
+                    rows = scrape_item(client, args.appid, name,
+                                       api_key=args.api_key,
+                                       fill=not args.no_fill_gaps)
+                except Exception as exc:  # keep going on a single bad item
+                    _warn(f"failed on {name!r}: {exc}")
+                    continue
+                rows_by_item.append(rows)
+                print(f"    +{len(rows)} observations")
+        except KeyboardInterrupt:
+            interrupted = True
+            print(f"\nInterrupted: saving {len(rows_by_item)} item(s) scraped so far ...")
+
+        since = None
+        if args.wide_days:
+            since = (datetime.now(timezone.utc).date()
+                     - timedelta(days=args.wide_days - 1)).isoformat()
+        fieldnames, wide_rows = pivot_wide(rows_by_item, since=since)
+        with open(args.output, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(wide_rows)
+        print(f"\nDone: {len(wide_rows)} items ({len(fieldnames) - len(WIDE_ID_COLS)} "
+              f"price columns) -> {args.output}")
+        return interrupted
+
+    mode = "a" if args.append else "w"
+    exists = os.path.exists(args.output) and os.path.getsize(args.output) > 0
+    total = 0
+    with open(args.output, mode, newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
+        if not (args.append and exists):
+            writer.writeheader()
+        try:
+            for i, name in enumerate(names, 1):
+                print(f"[{i}/{len(names)}] {name}")
+                try:
+                    rows = scrape_item(client, args.appid, name,
+                                       api_key=args.api_key,
+                                       fill=not args.no_fill_gaps)
+                except Exception as exc:  # keep going on a single bad item
+                    _warn(f"failed on {name!r}: {exc}")
+                    continue
+                writer.writerows(rows)
+                fh.flush()
+                total += len(rows)
+                print(f"    +{len(rows)} rows")
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nInterrupted: the item in progress was dropped "
+                  "(re-run with --resume to continue).")
+
+    print(f"\nDone: {total} rows -> {args.output}")
+    return interrupted
+
+
+def collect_snapshots(client: SteamClient, args, names: list[str], path: str):
+    """Poll `market/priceoverview` for every item every ``args.interval``
+    minutes and append one timestamped row per item to ``path``, building a
+    price history going forward (no login cookie needed). Runs until Ctrl+C
+    or ``args.cycles`` cycles; each row is flushed as soon as it's fetched."""
+    exists = os.path.exists(path) and os.path.getsize(path) > 0
+    if exists:
+        with open(path, newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh), [])
+        if header != SNAPSHOT_COLS:
+            sys.exit(f"error: {path} exists with a different header; "
+                     f"pass another --snapshot-output")
+    currency = CURRENCIES.get(client.currency, str(client.currency))
+    total = cycle = 0
+    print(f"\nCollecting snapshots of {len(names)} item(s) every "
+          f"{args.interval:g} min -> {path} (Ctrl+C to stop)")
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SNAPSHOT_COLS)
+        if not exists:
+            writer.writeheader()
+            fh.flush()
+        try:
+            while not args.cycles or cycle < args.cycles:
+                cycle += 1
+                started = time.time()
+                print(f"[cycle {cycle}] {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
+                got = 0
+                for name in names:
+                    try:
+                        ov = fetch_overview(client, args.appid, name)
+                    except Exception as exc:  # keep going on a single bad item
+                        _warn(f"failed on {name!r}: {exc}")
+                        continue
+                    if all(v is None for v in ov.values()):
+                        continue
+                    writer.writerow({
+                        "snapshot_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "appid": args.appid,
+                        "market_hash_name": name,
+                        "currency": currency,
+                        "lowest_price": ov["snap_lowest_price"],
+                        "median_price": ov["snap_median_price"],
+                        "volume_24h": ov["snap_volume_24h"],
+                    })
+                    fh.flush()
+                    got += 1
+                total += got
+                print(f"    +{got}/{len(names)} snapshots ({total} total)")
+                if args.cycles and cycle >= args.cycles:
+                    break
+                wait = args.interval * 60 - (time.time() - started)
+                if wait > 0:
+                    print(f"    next cycle in {wait / 60:.1f} min")
+                    time.sleep(wait)
+                else:
+                    _warn("cycle took longer than --interval; starting the next one now")
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+    print(f"Saved {total} snapshot row(s) over {cycle} cycle(s) -> {path}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -750,7 +892,23 @@ def main(argv=None):
                     help="Steam Web API key (or env STEAM_API_KEY), needed for item "
                          "tags/quality/rarity/exterior - get one free at "
                          "https://steamcommunity.com/dev/apikey")
+    ap.add_argument("--interval", type=float, default=0, metavar="MIN",
+                    help="after the history run, keep collecting: poll the current "
+                         "price of every item every MIN minutes and append "
+                         "timestamped rows to --snapshot-output until Ctrl+C")
+    ap.add_argument("--snapshot-output", metavar="PATH",
+                    help="CSV for --interval snapshots (default: <output>_snapshots.csv)")
+    ap.add_argument("--cycles", type=int, default=0, metavar="N",
+                    help="with --interval, stop after N cycles (default: run forever)")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="with --interval, skip the one-shot history run and only "
+                         "collect snapshots (e.g. when restarting the collector)")
     args = ap.parse_args(argv)
+
+    if args.interval < 0:
+        ap.error("--interval must be positive")
+    if (args.no_backfill or args.cycles) and not args.interval:
+        ap.error("--no-backfill / --cycles need --interval")
 
     if args.resume and args.wide:
         ap.error("--resume is not compatible with --wide (wide output is one row per "
@@ -804,67 +962,30 @@ def main(argv=None):
         ap.error("--wide is not compatible with --append (each run's date "
                   "columns differ, so wide output can't be appended safely)")
 
-    if args.resume:
-        done = _load_scraped_names(args.output)
-        if done:
-            kept = [n for n in names if n not in done]
-            print(f"Resume: {len(names) - len(kept)} of {len(names)} already in "
-                  f"{args.output}; {len(kept)} left to scrape")
-            names = kept
-        if not names:
+    all_names = names
+    interrupted = False
+    if not args.no_backfill:
+        if args.resume:
+            done = _load_scraped_names(args.output)
+            if done:
+                kept = [n for n in names if n not in done]
+                print(f"Resume: {len(names) - len(kept)} of {len(names)} already in "
+                      f"{args.output}; {len(kept)} left to scrape")
+                names = kept
+        if names:
+            interrupted = scrape_once(client, args, names)
+        else:
             print("Nothing to do: every requested item is already in the CSV.")
-            return
 
-    if args.wide:
-        rows_by_item = []
-        for i, name in enumerate(names, 1):
-            print(f"[{i}/{len(names)}] {name}")
-            try:
-                rows = scrape_item(client, args.appid, name,
-                                   api_key=args.api_key,
-                                   fill=not args.no_fill_gaps)
-            except Exception as exc:  # keep going on a single bad item
-                _warn(f"failed on {name!r}: {exc}")
-                continue
-            rows_by_item.append(rows)
-            print(f"    +{len(rows)} observations")
-
-        since = None
-        if args.wide_days:
-            since = (datetime.now(timezone.utc).date()
-                     - timedelta(days=args.wide_days - 1)).isoformat()
-        fieldnames, wide_rows = pivot_wide(rows_by_item, since=since)
-        with open(args.output, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(wide_rows)
-        print(f"\nDone: {len(wide_rows)} items ({len(fieldnames) - len(WIDE_ID_COLS)} "
-              f"price columns) -> {args.output}")
-        return
-
-    mode = "a" if args.append else "w"
-    exists = os.path.exists(args.output) and os.path.getsize(args.output) > 0
-    total = 0
-    with open(args.output, mode, newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
-        if not (args.append and exists):
-            writer.writeheader()
-        for i, name in enumerate(names, 1):
-            print(f"[{i}/{len(names)}] {name}")
-            try:
-                rows = scrape_item(client, args.appid, name,
-                                   api_key=args.api_key,
-                                   fill=not args.no_fill_gaps)
-            except Exception as exc:  # keep going on a single bad item
-                _warn(f"failed on {name!r}: {exc}")
-                continue
-            writer.writerows(rows)
-            fh.flush()
-            total += len(rows)
-            print(f"    +{len(rows)} rows")
-
-    print(f"\nDone: {total} rows -> {args.output}")
-
+    if interrupted:
+        sys.exit(130)
+    if args.interval:
+        collect_snapshots(client, args, all_names,
+                          args.snapshot_output or default_snapshot_path(args.output))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted before any data was collected.", file=sys.stderr)
+        sys.exit(130)
